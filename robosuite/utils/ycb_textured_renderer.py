@@ -63,10 +63,18 @@ def _swap_ycb_visuals_to_textured(scene_xml: str) -> str:
     pending_assets = []  # (texture_elem_attribs, material_elem_attribs)
     geom_material_updates = {}  # {mesh_name: material_name}
 
+    # Meshes drawn by see-through geoms (e.g. YCBVisualObject ghosts) keep
+    # their plain rgba instead of getting the opaque texture.
+    ghost_meshes = {
+        geom.get("mesh") for geom in root.iter("geom")
+        if geom.get("mesh") is not None
+        and float(geom.get("rgba", "1 1 1 1").split()[3]) < 1.0
+    }
+
     for mesh_elem in list(asset.findall("mesh")):
         file_attr = mesh_elem.get("file", "")
         m = _YCB_STL_RE.match(file_attr)
-        if m is None:
+        if m is None or mesh_elem.get("name") in ghost_meshes:
             continue
         base = m.group("base")
         textured_obj = os.path.join(base, "google_16k", "textured.obj")
@@ -149,12 +157,28 @@ class TexturedRenderer:
         for i in range(len(self._scene_option.sitegroup)):
             self._scene_option.sitegroup[i] = 0
 
+        # Floor: the arena "floor" plane has no group in the arena XMLs, so it
+        # lands in group 0 and is hidden by the geomgroup filter above, leaving
+        # a blue-grey background where mujoco_py draws the textured floor.
+        # Moving just that geom to group 1 restores the floor without also
+        # showing collision geoms. Disabled for now to keep existing Lift YCB
+        # eval images unchanged; uncomment to match mujoco_py's look.
+        # for gid in range(self.model.ngeom):
+        #     if mj.mj_id2name(self.model, mj.mjtObj.mjOBJ_GEOM, gid) == "floor":
+        #         self.model.geom_group[gid] = 1
+
         # Sanity: state vectors must align so qpos copy is valid.
         assert self.model.nq == env.sim.model.nq, (
             f"qpos size mismatch ({self.model.nq} vs {env.sim.model.nq}); the "
             "textured XML diverged structurally from the physics XML"
         )
         assert self.model.nv == env.sim.model.nv, "nv mismatch"
+        assert self.model.nbody == env.sim.model.nbody, "nbody mismatch"
+
+        # Snapshot of the sim's body poses at build time; render() only syncs
+        # bodies the env has moved since (see there).
+        self._sim_body_pos0 = env.sim.model.body_pos.copy()
+        self._sim_body_quat0 = env.sim.model.body_quat.copy()
 
     def render(self, env, camera_name: str) -> np.ndarray:
         """Sync state from env's mujoco_py sim and render one frame."""
@@ -165,6 +189,19 @@ class TexturedRenderer:
             )
         self.data.qpos[:] = env.sim.data.qpos
         self.data.qvel[:] = env.sim.data.qvel
+        # Jointless bodies (e.g. PickPlace's visual target markers) are placed
+        # by writing env.sim.model.body_pos/quat on reset, which the qpos copy
+        # above doesn't carry over. Must be set before mj_forward, which
+        # computes world poses from them. Only bodies the env has moved since
+        # this renderer was built are synced: the rest differ from the sim
+        # only by XML round-off (~1e-7), and copying those would shift
+        # eye-in-hand frames slightly vs. existing Lift results.
+        sim_pos, sim_quat = env.sim.model.body_pos, env.sim.model.body_quat
+        moved = (np.any(sim_pos != self._sim_body_pos0, axis=1)
+                 | np.any(sim_quat != self._sim_body_quat0, axis=1))
+        if moved.any():
+            self.model.body_pos[moved] = sim_pos[moved]
+            self.model.body_quat[moved] = sim_quat[moved]
         mj.mj_forward(self.model, self.data)
         self.renderer.update_scene(
             self.data, camera=camera_name, scene_option=self._scene_option,

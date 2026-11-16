@@ -23,4 +23,4 @@ from .composite import *
 from .composite_body import *
 from .group import *
 
-from .ycb_objects import YCBObject, list_ycb_objects
+from .ycb_objects import YCBObject, YCBVisualObject, list_ycb_objects

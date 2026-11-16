@@ -18,6 +18,8 @@ from robosuite.models.objects import (
     CerealVisualObject,
     CanVisualObject,
 )
+from robosuite.models.objects import YCBObject, YCBVisualObject
+from robosuite.environments.manipulation.lift import make_lift_object, YCB_OBJECTS
 from robosuite.models.tasks import ManipulationTask
 from robosuite.utils.placement_samplers import SequentialCompositeSampler, UniformRandomSampler
 from robosuite.utils.observables import Observable, sensor
@@ -96,6 +98,11 @@ class PickPlace(SingleArmEnv):
             or "can". Determines which type of object will be spawned on every
             environment reset. Only used if @single_object_mode is 2.
 
+        object_model (str): if provided, the @object_type object is built from this model instead of its default
+            one, while keeping its name and target bin. Accepts anything make_lift_object() accepts: a primitive
+            ("box", ...), an XML object ("lemon", ...), or a YCB id such as "011_banana" (optionally written
+            "ycb:011_banana"). Requires @single_object_mode to be 2.
+
         has_renderer (bool): If true, render the simulation state in
             a viewer instead of headless mode.
 
@@ -166,6 +173,7 @@ class PickPlace(SingleArmEnv):
         reward_shaping=False,
         single_object_mode=0,
         object_type=None,
+        object_model=None,
         has_renderer=False,
         has_offscreen_renderer=True,
         render_camera="frontview",
@@ -195,6 +203,10 @@ class PickPlace(SingleArmEnv):
             self.object_id = self.object_to_id[
                 object_type
             ]  # use for convenient indexing
+        if object_model is not None:
+            assert single_object_mode == 2 and object_type is not None, \
+                "@object_model requires single_object_mode=2 and an @object_type to replace"
+        self.object_model = object_model
         self.obj_to_use = None
 
         # settings for table top
@@ -398,11 +410,15 @@ class PickPlace(SingleArmEnv):
         bin_x_half = self.model.mujoco_arena.table_full_size[0] / 2 - 0.05
         bin_y_half = self.model.mujoco_arena.table_full_size[1] / 2 - 0.05
 
+        # With a custom @object_model (e.g. a large YCB object), only sample the active object: the inactive ones are
+        # cleared out of the scene on reset anyway, and requiring all of them to fit in the bin can fail
+        sampled_objects = [self.objects[self.object_id]] if self.object_model is not None else self.objects
+
         # each object should just be sampled in the bounds of the bin (with some tolerance)
         self.placement_initializer.append_sampler(
             sampler=UniformRandomSampler(
                 name="CollisionObjectSampler",
-                mujoco_objects=self.objects,
+                mujoco_objects=sampled_objects,
                 x_range=[-bin_x_half, bin_x_half],
                 y_range=[-bin_y_half, bin_y_half],
                 rotation=None,
@@ -451,6 +467,16 @@ class PickPlace(SingleArmEnv):
             )
             index += 1
 
+    def _object_model_ycb_id(self):
+        """
+        Returns:
+            str or None: the YCB id named by @object_model (bare or "ycb:"-prefixed), or None if it isn't a YCB object
+        """
+        if self.object_model is None:
+            return None
+        ycb_id = self.object_model[len("ycb:"):] if self.object_model.startswith("ycb:") else self.object_model
+        return ycb_id if ycb_id in YCB_OBJECTS else None
+
     def _load_model(self):
         """
         Loads an xml model, puts it in self.model
@@ -476,19 +502,28 @@ class PickPlace(SingleArmEnv):
 
         self.objects = []
         self.visual_objects = []
-        for vis_obj_cls, obj_name in zip(
+        for i, (vis_obj_cls, obj_name) in enumerate(zip(
                 (MilkVisualObject, BreadVisualObject, CerealVisualObject, CanVisualObject),
                 self.obj_names,
-        ):
+        )):
             vis_name = "Visual" + obj_name
-            vis_obj = vis_obj_cls(name=vis_name)
+            # A YCB @object_model gets a matching ghost as its target marker; other models keep the default one
+            ycb_id = self._object_model_ycb_id() if self.object_model is not None and i == self.object_id else None
+            if ycb_id is not None:
+                vis_obj = YCBVisualObject(name=vis_name, ycb_id=ycb_id)
+            else:
+                vis_obj = vis_obj_cls(name=vis_name)
             self.visual_objects.append(vis_obj)
 
-        for obj_cls, obj_name in zip(
+        for i, (obj_cls, obj_name) in enumerate(zip(
                 (MilkObject, BreadObject, CerealObject, CanObject),
                 self.obj_names,
-        ):
-            obj = obj_cls(name=obj_name)
+        )):
+            # Swap in @object_model for the active object; keep its name so bin / reward lookups still work
+            if self.object_model is not None and i == self.object_id:
+                obj = make_lift_object(name=obj_name, object_type=self.object_model)
+            else:
+                obj = obj_cls(name=obj_name)
             self.objects.append(obj)
 
         # task includes arena, robot, and objects of interest
@@ -534,6 +569,15 @@ class PickPlace(SingleArmEnv):
             bin_x_low += self.bin_size[0] / 4.
             bin_y_low += self.bin_size[1] / 4.
             self.target_bin_placements[i, :] = [bin_x_low, bin_y_low, self.bin2_pos[2]]
+
+        # Same as Lift: with a YCB object and camera obs, render camera frames through modern mujoco so the YCB
+        # textures show up (physics stays on mujoco_py). See Lift._setup_references() for why this is gated.
+        if (any(isinstance(obj, YCBObject) for obj in self.objects)
+                and getattr(self, "use_camera_obs", False)):
+            from robosuite.utils.ycb_textured_renderer import TexturedRenderer
+            h = self.camera_heights[0] if isinstance(self.camera_heights, (list, tuple)) else self.camera_heights
+            w = self.camera_widths[0] if isinstance(self.camera_widths, (list, tuple)) else self.camera_widths
+            self._ycb_textured_renderer = TexturedRenderer(self, height=h, width=w)
 
     def _setup_observables(self):
         """
@@ -593,6 +637,33 @@ class PickPlace(SingleArmEnv):
                     enabled=enabled,
                     active=active,
                 )
+
+        # Replace each camera_rgb sensor with a textured one (see Lift._setup_observables())
+        if hasattr(self, "_ycb_textured_renderer"):
+            from robosuite.utils import macros
+            from robosuite.utils.mjcf_utils import IMAGE_CONVENTION_MAPPING
+            conv = IMAGE_CONVENTION_MAPPING[macros.IMAGE_CONVENTION]
+            renderer = self._ycb_textured_renderer
+
+            def _make_textured_sensor(cam_name):
+                # Don't render during robosuite's shape probe (empty obs_cache), to avoid grabbing an EGL context
+                # in a parent process that later forks vector env workers
+                _shape_probe = np.zeros((renderer._h, renderer._w, 3), dtype=np.uint8)
+                @sensor(modality="image")
+                def textured_camera_rgb(obs_cache):
+                    if not obs_cache:
+                        return _shape_probe
+                    # flip to mujoco_py's bottom-left origin before applying the usual convention
+                    img = renderer.render(self, camera_name=cam_name)
+                    img = np.flipud(img)
+                    return img[::conv]
+                return textured_camera_rgb
+
+            cam_names = self.camera_names if isinstance(self.camera_names, (list, tuple)) else [self.camera_names]
+            for cam_name in cam_names:
+                key = f"{cam_name}_image"
+                if key in observables:
+                    observables[key].set_sensor(_make_textured_sensor(cam_name))
 
         return observables
 
@@ -759,46 +830,62 @@ class PickPlaceSingle(PickPlace):
 class PickPlaceMilk(PickPlace):
     """
     Easier version of task - place one milk into its bin.
+
+    Args:
+        object_type (str): optional model to use in place of the milk (see PickPlace's @object_model), e.g. a
+            YCB id such as "011_banana". It is still placed into the milk's bin.
     """
 
-    def __init__(self, **kwargs):
+    def __init__(self, object_type=None, **kwargs):
         assert (
-                "single_object_mode" not in kwargs and "object_type" not in kwargs
+                "single_object_mode" not in kwargs and "object_model" not in kwargs
         ), "invalid set of arguments"
-        super().__init__(single_object_mode=2, object_type="milk", **kwargs)
+        super().__init__(single_object_mode=2, object_type="milk", object_model=object_type, **kwargs)
 
 
 class PickPlaceBread(PickPlace):
     """
     Easier version of task - place one bread into its bin.
+
+    Args:
+        object_type (str): optional model to use in place of the bread (see PickPlace's @object_model), e.g. a
+            YCB id such as "011_banana". It is still placed into the bread's bin.
     """
 
-    def __init__(self, **kwargs):
+    def __init__(self, object_type=None, **kwargs):
         assert (
-                "single_object_mode" not in kwargs and "object_type" not in kwargs
+                "single_object_mode" not in kwargs and "object_model" not in kwargs
         ), "invalid set of arguments"
-        super().__init__(single_object_mode=2, object_type="bread", **kwargs)
+        super().__init__(single_object_mode=2, object_type="bread", object_model=object_type, **kwargs)
 
 
 class PickPlaceCereal(PickPlace):
     """
     Easier version of task - place one cereal into its bin.
+
+    Args:
+        object_type (str): optional model to use in place of the cereal (see PickPlace's @object_model), e.g. a
+            YCB id such as "011_banana". It is still placed into the cereal's bin.
     """
 
-    def __init__(self, **kwargs):
+    def __init__(self, object_type=None, **kwargs):
         assert (
-                "single_object_mode" not in kwargs and "object_type" not in kwargs
+                "single_object_mode" not in kwargs and "object_model" not in kwargs
         ), "invalid set of arguments"
-        super().__init__(single_object_mode=2, object_type="cereal", **kwargs)
+        super().__init__(single_object_mode=2, object_type="cereal", object_model=object_type, **kwargs)
 
 
 class PickPlaceCan(PickPlace):
     """
     Easier version of task - place one can into its bin.
+
+    Args:
+        object_type (str): optional model to use in place of the can (see PickPlace's @object_model), e.g. a
+            YCB id such as "011_banana". It is still placed into the can's bin.
     """
 
-    def __init__(self, **kwargs):
+    def __init__(self, object_type=None, **kwargs):
         assert (
-                "single_object_mode" not in kwargs and "object_type" not in kwargs
+                "single_object_mode" not in kwargs and "object_model" not in kwargs
         ), "invalid set of arguments"
-        super().__init__(single_object_mode=2, object_type="can", **kwargs)
+        super().__init__(single_object_mode=2, object_type="can", object_model=object_type, **kwargs)

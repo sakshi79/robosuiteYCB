@@ -62,3 +62,42 @@ class YCBObject(MujocoXMLObject):
     @property
     def ycb_id(self):
         return self._ycb_id
+
+
+class YCBVisualObject(MujocoXMLObject):
+    """Visual fiducial ("ghost") of a YCB object, e.g. to mark its target in PickPlace.
+
+    Same visual mesh as YCBObject, but no joints and no collision geoms, drawn in the
+    same see-through gray as robosuite's other visual objects (e.g. can-visual.xml).
+
+    Args:
+        name (str): The name this object will have in the env's scope
+        ycb_id (str): YCB dataset object ID, e.g. '011_banana'
+    """
+
+    RGBA = "0.8 0.8 0.8 0.3"
+
+    def __init__(self, name, ycb_id):
+        xml_path = os.path.join(_XML_DIR, f"{ycb_id}.xml")
+        if not os.path.isfile(xml_path):
+            raise FileNotFoundError(f"No YCB XML for '{ycb_id}' at {xml_path}.")
+        if not ycb_download.is_downloaded(ycb_id):
+            ycb_download.download(ycb_id)
+        super().__init__(
+            xml_path,
+            name=name,
+            joints=None,
+            obj_type="visual",
+            duplicate_collision_geoms=False,
+        )
+        for geom in self._obj.iter("geom"):
+            geom.set("rgba", self.RGBA)
+        # Collision meshes are unused once the collision geoms are dropped
+        for mesh in list(self.asset.findall("mesh")):
+            if "collision" in mesh.get("name", ""):
+                self.asset.remove(mesh)
+        self._ycb_id = ycb_id
+
+    @property
+    def ycb_id(self):
+        return self._ycb_id
