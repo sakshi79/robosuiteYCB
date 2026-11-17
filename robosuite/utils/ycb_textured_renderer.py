@@ -163,9 +163,9 @@ class TexturedRenderer:
         # Moving just that geom to group 1 restores the floor without also
         # showing collision geoms. Disabled for now to keep existing Lift YCB
         # eval images unchanged; uncomment to match mujoco_py's look.
-        # for gid in range(self.model.ngeom):
-        #     if mj.mj_id2name(self.model, mj.mjtObj.mjOBJ_GEOM, gid) == "floor":
-        #         self.model.geom_group[gid] = 1
+        for gid in range(self.model.ngeom):
+            if mj.mj_id2name(self.model, mj.mjtObj.mjOBJ_GEOM, gid) == "floor":
+                self.model.geom_group[gid] = 1
 
         # Sanity: state vectors must align so qpos copy is valid.
         assert self.model.nq == env.sim.model.nq, (
